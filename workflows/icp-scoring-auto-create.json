@@ -1,0 +1,320 @@
+{
+  "name": "ICP Scoring — Auto-create records",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "minutes",
+              "minutesInterval": 5
+            }
+          ]
+        }
+      },
+      "name": "Every 5 minutes",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        0,
+        0
+      ]
+    },
+    {
+      "parameters": {},
+      "name": "Run manually (testing)",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        0,
+        200
+      ]
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "https://sheets.googleapis.com/v4/spreadsheets/YOUR_SPREADSHEET_ID/values:batchGet?ranges=%27Company%20Database%27%21A2%3AL&ranges=%27ICP%20Scoring%27%21A12%3AA&ranges=%27ICP%20Scoring%27%21B4%3AB9&ranges=%27Automation%20Log%27%21A2%3AF",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "googleSheetsOAuth2Api",
+        "options": {}
+      },
+      "name": "Read sheet",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        240,
+        100
+      ],
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "",
+          "name": "Google Sheets account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// ICP auto-scoring: find companies in Company Database without an ICP Scoring record and score them\n// conservatively with the existing framework. Writes only to input columns; formulas do the totals.\nconst SHEET = 'YOUR_SPREADSHEET_ID';\nconst MAX_ATTEMPTS = 3;\nconst vr = $input.first().json.valueRanges || [];\nconst db = (vr[0] && vr[0].values) || [];\nconst scored = (vr[1] && vr[1].values) || [];\nconst settings = (vr[2] && vr[2].values) || [];\nconst log = (vr[3] && vr[3].values) || [];\n\nconst norm = s => String(s == null ? '' : s).trim().replace(/\\s+/g, ' ').toLowerCase();\nconst POINTS_PER_DRIVER = Number(settings[3] && settings[3][0]); // ICP Scoring!B7\nif (!POINTS_PER_DRIVER) throw new Error('Could not read scoring settings (ICP Scoring!B4:B9). Nothing was written.');\n\nconst existing = new Set(scored.map(r => norm(r[0])).filter(Boolean));\nlet nextRow = 12 + scored.length; // first empty row after the last scoring record\nconst errCount = {}; const gaveUp = new Set(); const skipLogged = new Set();\nfor (const r of log) {\n  const n = norm(r[1]);\n  if (r[2] === 'error') errCount[n] = (errCount[n] || 0) + 1;\n  if (r[2] === 'gave up') gaveUp.add(n);\n  if (r[2] === 'skipped') skipLogged.add(n);\n}\n\nconst host = u => { const m = String(u == null ? '' : u).trim().match(/^https?:\\/\\/([^\\/?#:\\s]+)/i); return m ? m[1].replace(/^www\\./, '').toLowerCase() : ''; };\nconst rootOf = h => h.split('.').slice(-2).join('.');\nconst DRIVERS = [\n  ['Failed payments', /\\b(failed|declined|unsuccessful)\\b/i],\n  ['Refunds', /\\brefund/i],\n  ['Disputes / payment exceptions', /\\b(chargebacks?|disputes?|underpa(id|yment)|overpa(id|yment))\\b/i],\n  ['KYC/KYB or account restrictions', /\\b(kyc|kyb|identity verification|verify your identity|account (is )?(restricted|suspended|locked|blocked|deactivated|closed))\\b/i],\n  ['Settlement / payout issues', /\\b(payouts?|settlements?|withdrawals?)\\b/i],\n];\nconst COMPLAINT_SITES = ['trustpilot.com', 'g2.com', 'bbb.org', 'financial-ombudsman.org.uk', 'consumeraffairs.com', 'sitejabber.com'];\nconst MONEY = /(payment|payout|acquir|on-?ramp|off-?ramp|remittance|money transfer|cross-border|gateway|processing|settlement rails)/i;\nconst OTHER_LINES = /(issuer|exchange|trading|custody|lending|wallet provider|brokerage)/i;\nconst ADJACENT = /(fintech|financial|bank|crypto|blockchain|stablecoin|wallet)/i;\nconst SMB = /(consumer|individual|freelancer|end users?|shoppers?|smbs?|small business|self-serve|startups?|creators?|sellers)/i;\nconst ENT = /(enterprise|institution|banks|psps?|businesses only|large merchants)/i;\n\nfunction businessFit(text) {\n  const t = String(text || '');\n  if (!t.trim()) return { pts: 0, why: 'business model missing' };\n  const m = t.search(MONEY), o = t.search(OTHER_LINES);\n  if (m >= 0 && o >= 0 && o < m) return { pts: 20, why: 'payments is one of several business lines' };\n  if (m >= 0) return { pts: 30, why: 'core product moves money' };\n  if (ADJACENT.test(t)) return { pts: 10, why: 'adjacent infrastructure' };\n  return { pts: 0, why: 'business model does not indicate payments' };\n}\nfunction companyScale(text) {\n  const t = String(text || '').trim();\n  if (!t) return { pts: 0, why: 'size missing' };\n  if (/unknown/i.test(t)) return { pts: 4, why: 'size Unknown' };\n  const m = t.match(/(\\d{1,3}(?:,\\d{3})+|\\d+)/);\n  if (!m) return { pts: 4, why: 'size not parseable, treated as Unknown' };\n  const n = Number(m[1].replace(/,/g, ''));\n  const pts = n >= 2000 ? 20 : n >= 500 ? 16 : n >= 200 ? 12 : n >= 50 ? 8 : 4;\n  return { pts, why: (/est|third-party|~/i.test(t) ? 'est. ' : '') + n.toLocaleString('en-US') + ' employees (low end used)' };\n}\nfunction customerType(text) {\n  const t = String(text || '');\n  if (!t.trim()) return { pts: 0, why: 'target customer missing' };\n  const s = SMB.test(t), e = ENT.test(t);\n  if (s && e) return { pts: 6, why: 'mixed customer base' };\n  if (s) return { pts: 10, why: 'consumer/SMB self-serve' };\n  return { pts: 3, why: 'enterprise/business only' };\n}\n\nconst out = [];\nconst seen = new Set();\nfor (const r of db) {\n  const company = String(r[0] || '').trim();\n  const key = norm(company);\n  if (!key) continue;\n  if (existing.has(key)) continue;                       // already scored: no duplicate\n  if (seen.has(key)) {                                    // same company twice in Company Database\n    if (!skipLogged.has(key)) out.push({ json: { action: 'log', company, event: 'skipped', detail: 'Duplicate name in Company Database; only one scoring record is created.', row: '' } });\n    continue;\n  }\n  seen.add(key);\n  if ((errCount[key] || 0) >= MAX_ATTEMPTS) {\n    if (!gaveUp.has(key)) out.push({ json: { action: 'log', company, event: 'gave up', detail: `Failed ${MAX_ATTEMPTS} times. Needs manual review; delete its error rows here to retry.`, row: '' } });\n    continue;\n  }\n\n  const website = r[1], model = r[3], target = r[5], size = r[6], sources = String(r[10] || '');\n  const fit = businessFit(model), scale = companyScale(size), cust = customerType(target);\n\n  // Support drivers: only from pages on the company's own domain that actually load\n  const urls = sources.split(/\\s*\\|\\s*|\\s+/).map(s => s.trim()).filter(s => /^https?:\\/\\//i.test(s));\n  const siteRoot = host(website) ? rootOf(host(website)) : '';\n  const official = siteRoot ? urls.filter(u => rootOf(host(u)) === siteRoot) : [];\n  const found = new Set(); let loaded = 0; const failed = [];\n  for (const u of official.slice(0, 6)) {\n    try {\n      const html = await this.helpers.httpRequest({ method: 'GET', url: u, timeout: 15000, json: false, headers: { 'User-Agent': 'Mozilla/5.0 (ICP research bot)' } });\n      const text = String(html).replace(/<script[\\s\\S]*?<\\/script>|<style[\\s\\S]*?<\\/style>/gi, ' ').replace(/<[^>]+>/g, ' ');\n      loaded++;\n      DRIVERS.forEach(([name, re], i) => { if (re.test(text)) found.add(i); });\n    } catch (e) { failed.push(host(u)); }\n  }\n  const flags = DRIVERS.map((_, i) => found.has(i));\n  const complaintHosts = new Set(urls.map(host).filter(h => COMPLAINT_SITES.some(c => h === c || h.endsWith('.' + c))).map(h => COMPLAINT_SITES.find(c => h === c || h.endsWith('.' + c))));\n  const compl = complaintHosts.size >= 2 ? 10 : complaintHosts.size === 1 ? 5 : 0;\n\n  const driverNames = DRIVERS.filter((_, i) => found.has(i)).map(d => d[0].toLowerCase());\n  const parts = [\n    `Business fit: ${fit.why}`,\n    `scale: ${scale.why}`,\n    official.length === 0 ? 'support drivers: no official help pages in Source, none counted'\n      : `support drivers: ${driverNames.length}/5 found on ${loaded} of ${official.length} official page(s)` + (driverNames.length ? ` (${driverNames.join(', ')})` : '') + (failed.length ? `; ${failed.length} page(s) failed to load` : ''),\n    `customer type: ${cust.why}`,\n    `complaint sources: ${complaintHosts.size}`,\n  ];\n  const reason = 'Auto-scored. ' + parts.join('; ') + '. Needs analyst review.';\n  const safe = s => (/^[=+\\-@]/.test(s) ? \"'\" + s : s);\n  const row = nextRow++;\n  const blank0 = n => (n === 0 ? '' : n); // blank counts as 0 in the formulas and passes dropdown validation\n  out.push({ json: {\n    action: 'create', company, row,\n    summary: parts.join('; '),\n    data: [\n      { range: `'ICP Scoring'!A${row}:H${row}`, values: [[safe(company), blank0(fit.pts), blank0(scale.pts), ...flags]] },\n      { range: `'ICP Scoring'!K${row}:L${row}`, values: [[blank0(cust.pts), compl]] },\n      { range: `'ICP Scoring'!Q${row}:S${row}`, values: [[reason, 'Auto', 'Needs review']] },\n    ],\n  } });\n}\nreturn out;\n"
+      },
+      "name": "Find unscored companies and score",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        480,
+        100
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "c1",
+              "leftValue": "={{ $json.action }}",
+              "rightValue": "create",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "name": "Is new record?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        720,
+        100
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://sheets.googleapis.com/v4/spreadsheets/YOUR_SPREADSHEET_ID/values:batchUpdate",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "googleSheetsOAuth2Api",
+        "options": {},
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ valueInputOption: \"USER_ENTERED\", data: $json.data }) }}"
+      },
+      "name": "Write scoring row",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        960,
+        0
+      ],
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "",
+          "name": "Google Sheets account"
+        }
+      },
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "={{ 'https://sheets.googleapis.com/v4/spreadsheets/YOUR_SPREADSHEET_ID/values/' + encodeURIComponent(\"'ICP Scoring'!A\" + $('Is new record?').item.json.row + ':S' + $('Is new record?').item.json.row) }}",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "googleSheetsOAuth2Api",
+        "options": {}
+      },
+      "name": "Read back row",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1200,
+        -80
+      ],
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "",
+          "name": "Google Sheets account"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "const norm = s => String(s == null ? '' : s).trim().replace(/\\s+/g, ' ').toLowerCase();\nconst src = $('Is new record?').item.json;\nconst v = (($json.values || [])[0]) || [];\nconst ok = norm(v[0]) === norm(src.company) && v[13] !== undefined && v[13] !== '';\nreturn { json: {\n  company: src.company, row: src.row,\n  event: ok ? 'created' : 'error',\n  detail: ok ? `Scoring record created. Total ${v[13]}, ${v[14]}, complexity ${v[15]}. ${src.summary}`\n             : `Row ${src.row} was written but the read-back did not match (found: ${JSON.stringify(v.slice(0, 2))}). Check the row before retrying.`,\n} };"
+      },
+      "name": "Verify and describe",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1440,
+        -80
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "const src = $('Is new record?').item.json;\nconst e = $json.error || {};\nreturn { json: { company: src.company, row: src.row, event: 'error',\n  detail: 'Write to ICP Scoring failed: ' + (e.message || e.description || JSON.stringify(e)).slice(0, 400) + '. Will retry on the next run.' } };"
+      },
+      "name": "Describe write error",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1200,
+        120
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://sheets.googleapis.com/v4/spreadsheets/YOUR_SPREADSHEET_ID/values/%27Automation%20Log%27%21A%3AF:append?valueInputOption=RAW&insertDataOption=INSERT_ROWS",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "googleSheetsOAuth2Api",
+        "options": {},
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ values: [[ new Date().toISOString(), $json.company, $json.event, $json.detail, $json.row === undefined ? \"\" : String($json.row), $execution.id ]] }) }}"
+      },
+      "name": "Write to Automation Log",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1700,
+        100
+      ],
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "",
+          "name": "Google Sheets account"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Every 5 minutes": {
+      "main": [
+        [
+          {
+            "node": "Read sheet",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Run manually (testing)": {
+      "main": [
+        [
+          {
+            "node": "Read sheet",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Read sheet": {
+      "main": [
+        [
+          {
+            "node": "Find unscored companies and score",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Find unscored companies and score": {
+      "main": [
+        [
+          {
+            "node": "Is new record?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Is new record?": {
+      "main": [
+        [
+          {
+            "node": "Write scoring row",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Write to Automation Log",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Write scoring row": {
+      "main": [
+        [
+          {
+            "node": "Read back row",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Describe write error",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Read back row": {
+      "main": [
+        [
+          {
+            "node": "Verify and describe",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Verify and describe": {
+      "main": [
+        [
+          {
+            "node": "Write to Automation Log",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Describe write error": {
+      "main": [
+        [
+          {
+            "node": "Write to Automation Log",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "timezone": "Africa/Lagos",
+    "saveManualExecutions": true
+  }
+}

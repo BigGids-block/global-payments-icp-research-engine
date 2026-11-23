@@ -1,0 +1,79 @@
+{
+  "name": "ICP Scoring — Error logger",
+  "nodes": [
+    {
+      "parameters": {},
+      "name": "When scoring workflow fails",
+      "type": "n8n-nodes-base.errorTrigger",
+      "typeVersion": 1,
+      "position": [
+        0,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const ex = $json.execution || {}; const err = ex.error || {};\nreturn [{ json: { company: '(workflow)', row: '', event: 'error',\n  detail: `Run failed at \"${ex.lastNodeExecuted || 'unknown node'}\": ${String(err.message || 'unknown error').slice(0, 400)}. Nothing after that step ran; the next scheduled run retries.`,\n  execId: ex.id || '' } }];"
+      },
+      "name": "Describe failure",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        240,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://sheets.googleapis.com/v4/spreadsheets/YOUR_SPREADSHEET_ID/values/%27Automation%20Log%27%21A%3AF:append?valueInputOption=RAW&insertDataOption=INSERT_ROWS",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "googleSheetsOAuth2Api",
+        "options": {},
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ values: [[ new Date().toISOString(), $json.company, $json.event, $json.detail, \"\", String($json.execId) ]] }) }}"
+      },
+      "name": "Write to Automation Log",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        480,
+        0
+      ],
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "",
+          "name": "Google Sheets account"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "When scoring workflow fails": {
+      "main": [
+        [
+          {
+            "node": "Describe failure",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Describe failure": {
+      "main": [
+        [
+          {
+            "node": "Write to Automation Log",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  }
+}
